@@ -16,7 +16,7 @@ function Avatar({ src, alt }) {
     );
 }
 
-export default function ChatList({ user, onSelectChat, selectedChat }) {
+export default function ChatList({ user, onSelectChat, selectedChat, socket }) {
     const [chats, setChats] = useState([]);
     const [search, setSearch] = useState("");
     const [results, setResults] = useState([]);
@@ -35,24 +35,41 @@ export default function ChatList({ user, onSelectChat, selectedChat }) {
         if (!user) return;
 
         const fetchChats = () => {
-            fetch(`${apiBase}/chats/${user.username}`)
+            fetch(`${apiBase}/chats/${user.username}`, {
+                headers: { "Authorization": `Bearer ${user.token}` }
+            })
                 .then((res) => res.json())
                 .then((data) => setChats(data))
                 .catch((err) => console.error("Failed to fetch chats:", err));
         };
 
         fetchChats();
-        const interval = setInterval(fetchChats, 3000);
-        return () => clearInterval(interval);
-    }, [user]);
+
+        if (!socket) return;
+
+        const handleChatCreated = (newChat) => {
+            setChats((prev) => {
+                if (prev.find((c) => c.id === newChat.id)) return prev;
+                return [...prev, newChat];
+            });
+        };
+
+        socket.on("chat_created", handleChatCreated);
+
+        return () => {
+            socket.off("chat_created", handleChatCreated);
+        };
+    }, [user, socket]);
 
     // Fetch messages for last message snippet AND unseen count
     useEffect(() => {
+        if (!user) return;
         chats.forEach((chat) => {
-            fetch(`${apiBase}/messages/${chat.id}`)
+            fetch(`${apiBase}/messages/${chat.id}`, {
+                headers: { "Authorization": `Bearer ${user.token}` }
+            })
                 .then((res) => res.json())
                 .then((messages) => {
-                    // Last message snippet
                     if (messages.length > 0) {
                         const lastMsg = messages[messages.length - 1];
                         const snippet =
@@ -67,7 +84,6 @@ export default function ChatList({ user, onSelectChat, selectedChat }) {
                         setLastMessages((prev) => ({ ...prev, [chat.id]: "" }));
                     }
 
-                    // Count unseen messages (from partner, unseen by user)
                     const unseenCount = messages.filter(
                         (msg) => !msg.seen && msg.sender !== user.username
                     ).length;
@@ -87,7 +103,44 @@ export default function ChatList({ user, onSelectChat, selectedChat }) {
                     setUnseenCountMap((prev) => ({ ...prev, [chat.id]: 0 }));
                 });
         });
-    }, [chats, user.username]);
+    }, [chats, user.username, user.token]);
+
+    // Handle real-time updates via Socket.IO
+    useEffect(() => {
+        if (!socket) return;
+
+        const handleIncomingMessage = (msg) => {
+            const snippet = msg.content.length > 40 ? msg.content.slice(0, 40) + "..." : msg.content;
+            setLastMessages((prev) => ({
+                ...prev,
+                [msg.chatId]: snippet,
+            }));
+
+            if (msg.sender !== user.username && selectedChat?.id !== msg.chatId) {
+                setUnseenCountMap((prev) => ({
+                    ...prev,
+                    [msg.chatId]: (prev[msg.chatId] || 0) + 1,
+                }));
+            }
+        };
+
+        const handleMessagesSeen = ({ chatId, username }) => {
+            if (username === user.username) {
+                setUnseenCountMap((prev) => ({
+                    ...prev,
+                    [chatId]: 0,
+                }));
+            }
+        };
+
+        socket.on("message", handleIncomingMessage);
+        socket.on("messages_seen", handleMessagesSeen);
+
+        return () => {
+            socket.off("message", handleIncomingMessage);
+            socket.off("messages_seen", handleMessagesSeen);
+        };
+    }, [socket, user.username, selectedChat]);
 
     // Fetch partner user info
     useEffect(() => {
@@ -98,7 +151,8 @@ export default function ChatList({ user, onSelectChat, selectedChat }) {
                 if (!partnerInfoMap[partner]) {
                     try {
                         const res = await fetch(
-                            `${apiBase}/get-user/${partner}`
+                            `${apiBase}/get-user/${partner}`,
+                            { headers: { "Authorization": `Bearer ${user.token}` } }
                         );
                         const data = await res.json();
                         newInfo[partner] = data;
@@ -115,13 +169,15 @@ export default function ChatList({ user, onSelectChat, selectedChat }) {
             }
         };
         if (chats.length > 0) fetchPartnerInfos();
-    }, [chats]);
+    }, [chats, user.username, user.token]);
 
     // Search users for new chat
     useEffect(() => {
         const delayDebounce = setTimeout(() => {
             if (search.trim()) {
-                fetch(`${apiBase}/search?username=${search}`)
+                fetch(`${apiBase}/search?username=${search}`, {
+                    headers: { "Authorization": `Bearer ${user.token}` }
+                })
                     .then((res) => res.json())
                     .then((data) => setResults(data));
             } else {
@@ -129,16 +185,22 @@ export default function ChatList({ user, onSelectChat, selectedChat }) {
             }
         }, 300);
         return () => clearTimeout(delayDebounce);
-    }, [search]);
+    }, [search, user.token]);
 
     const startChat = async (recipient) => {
         const res = await fetch(`${apiBase}/chats`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${user.token}`
+            },
             body: JSON.stringify({ user1: user.username, user2: recipient }),
         });
         const chat = await res.json();
-        setChats((prev) => [...prev, chat]);
+        setChats((prev) => {
+            if (prev.find((c) => c.id === chat.id)) return prev;
+            return [...prev, chat];
+        });
         onSelectChat(chat);
         setSearch("");
         setResults([]);

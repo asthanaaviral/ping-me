@@ -4,20 +4,37 @@ const bodyParser = require("body-parser");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
-const { readData, writeData } = require("./utils");
+const http = require("http");
+const { Server } = require("socket.io");
+const mongoose = require("mongoose");
+const jwt = require("jsonwebtoken");
+require("dotenv").config();
+
+// Models
+const User = require("./models/User");
+const Chat = require("./models/Chat");
+const Message = require("./models/Message");
+
+// Middleware
+const authMiddleware = require("./middleware/auth");
 
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/pingme";
+const JWT_SECRET = process.env.JWT_SECRET || "super_secret_pingme_key_2026";
 
-const dataDir = path.join(__dirname, "data");
-const usersFile = path.join(dataDir, "users.json");
-const chatsFile = path.join(dataDir, "chats.json");
-const messagesFile = path.join(dataDir, "messages.json");
+// DB Connection
+mongoose.connect(MONGODB_URI)
+    .then(() => console.log("Connected to MongoDB successfully"))
+    .catch((err) => console.error("MongoDB connection error:", err));
 
 const uploadDir = path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+}
 
 const upload = multer({
     dest: uploadDir,
@@ -25,65 +42,126 @@ const upload = multer({
 
 app.use("/uploads", express.static(uploadDir));
 
-// Register
-app.post("/register", (req, res) => {
-    const { username, email, password } = req.body;
-    if (!username || !email || !password)
-        return res.status(400).json({ message: "Missing fields" });
-
-    const users = readData(usersFile);
-    if (users.find((u) => u.username === username)) {
-        return res.status(400).json({ message: "Username already exists" });
+// HTTP & Socket Server Setup
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
     }
-    users.push({ username, email, password, dp: null }); // Add dp as null initially
-    writeData(usersFile, users);
-    res.json({ message: "Registration successful" });
 });
 
-// Login
-app.post("/login", (req, res) => {
-    const { username, password } = req.body;
-    const users = readData(usersFile);
-    const user = users.find(
-        (u) => u.username === username && u.password === password
-    );
-    if (!user)
-        return res
-            .status(401)
-            .json({ message: "Invalid username or password" });
+// Socket Auth Verification
+io.use((socket, next) => {
+    const token = socket.handshake.auth.token;
+    if (!token) return next(new Error("Authentication error: No token provided"));
 
-    res.json({
-        username: user.username,
-        email: user.email,
-        dp: user.dp || null,
+    jwt.verify(token, JWT_SECRET, (err, decoded) => {
+        if (err) return next(new Error("Authentication error: Invalid token"));
+        socket.user = decoded;
+        next();
     });
 });
 
-// Search users by username (starts with)
-app.get("/search", (req, res) => {
-    const { username = "" } = req.query;
-    const users = readData(usersFile);
-    const matches = users.filter((u) =>
-        u.username.toLowerCase().startsWith(username.toLowerCase())
-    );
-    // Return username and dp only (avoid sending password/email unnecessarily)
-    const safeMatches = matches.map(({ username, dp }) => ({
-        username,
-        dp: dp || null,
-    }));
-    res.json(safeMatches);
+// Socket connection logic
+io.on("connection", (socket) => {
+    const username = socket.user.username;
+    console.log(`User connected to websocket: ${username}`);
+    socket.join(username);
+
+    socket.on("disconnect", () => {
+        console.log(`User disconnected: ${username}`);
+    });
 });
 
-// Get chats for user
-app.get("/chats/:username", (req, res) => {
-    const { username } = req.params;
-    const chats = readData(chatsFile);
-    const userChats = chats.filter((c) => c.users.includes(username));
-    res.json(userChats);
+// Register
+app.post("/register", async (req, res) => {
+    try {
+        const { username, email, password } = req.body;
+        if (!username || !email || !password)
+            return res.status(400).json({ message: "Missing fields" });
+
+        const existingUser = await User.findOne({ username });
+        if (existingUser) {
+            return res.status(400).json({ message: "Username already exists" });
+        }
+
+        const newUser = new User({ username, email, password });
+        await newUser.save();
+        res.json({ message: "Registration successful" });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Server error during registration" });
+    }
 });
 
-// Upload profile picture (dp)
-app.post("/upload-dp/:username", upload.single("dp"), (req, res) => {
+// Login
+app.post("/login", async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        const user = await User.findOne({ username });
+        if (!user) {
+            return res.status(401).json({ message: "Invalid username or password" });
+        }
+
+        const isMatch = await user.comparePassword(password);
+        if (!isMatch) {
+            return res.status(401).json({ message: "Invalid username or password" });
+        }
+
+        const token = jwt.sign(
+            { username: user.username, email: user.email },
+            JWT_SECRET,
+            { expiresIn: "7d" }
+        );
+
+        res.json({
+            username: user.username,
+            email: user.email,
+            dp: user.dp || null,
+            token
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Server error during login" });
+    }
+});
+
+// Search users by username (starts with) - protected
+app.get("/search", authMiddleware, async (req, res) => {
+    try {
+        const { username = "" } = req.query;
+        const matches = await User.find({
+            username: { $regex: "^" + username, $options: "i" }
+        });
+        const safeMatches = matches.map(({ username, dp }) => ({
+            username,
+            dp: dp || null,
+        }));
+        res.json(safeMatches);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Server error during user search" });
+    }
+});
+
+// Get chats for user - protected
+app.get("/chats/:username", authMiddleware, async (req, res) => {
+    try {
+        const { username } = req.params;
+        if (username !== req.user.username) {
+            return res.status(403).json({ message: "Unauthorized access to chats" });
+        }
+        const userChats = await Chat.find({ users: username });
+        res.json(userChats);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Server error fetching chats" });
+    }
+});
+
+// Upload profile picture (dp) - unprotected (runs post-register, pre-login)
+app.post("/upload-dp/:username", upload.single("dp"), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ message: "No file uploaded" });
@@ -96,15 +174,16 @@ app.post("/upload-dp/:username", upload.single("dp"), (req, res) => {
         // Rename uploaded file to username + extension
         fs.renameSync(req.file.path, newPath);
 
-        const users = readData(usersFile);
-        const user = users.find((u) => u.username === username);
+        const user = await User.findOne({ username });
         if (user) {
             user.dp = `/uploads/${newFilename}`;
-            writeData(usersFile, users);
+            await user.save();
             res.json({ success: true, dp: user.dp });
         } else {
             // Remove the uploaded file if user not found
-            fs.unlinkSync(newPath);
+            if (fs.existsSync(newPath)) {
+                fs.unlinkSync(newPath);
+            }
             res.status(404).json({ message: "User not found" });
         }
     } catch (err) {
@@ -113,109 +192,128 @@ app.post("/upload-dp/:username", upload.single("dp"), (req, res) => {
     }
 });
 
-// Create or get chat between two users
-app.post("/chats", (req, res) => {
-    const { user1, user2 } = req.body;
-    if (!user1 || !user2)
-        return res.status(400).json({ message: "Missing users" });
+// Create or get chat between two users - protected
+app.post("/chats", authMiddleware, async (req, res) => {
+    try {
+        const { user1, user2 } = req.body;
+        if (!user1 || !user2)
+            return res.status(400).json({ message: "Missing users" });
 
-    let chats = readData(chatsFile);
-    let chat = chats.find(
-        (c) => c.users.includes(user1) && c.users.includes(user2)
-    );
+        let chat = await Chat.findOne({
+            users: { $all: [user1, user2] }
+        });
+        if (chat && user1 !== user2 && chat.users.length !== 2) {
+            chat = null;
+        }
 
-    if (!chat) {
-        chat = {
-            id: Date.now().toString(),
-            users: [user1, user2],
-        };
-        chats.push(chat);
-        writeData(chatsFile, chats);
+        if (!chat) {
+            chat = new Chat({
+                users: [user1, user2],
+            });
+            await chat.save();
+            
+            // Emit chat creation to participants
+            const chatJSON = chat.toJSON();
+            io.to(user1).to(user2).emit("chat_created", chatJSON);
+        }
+
+        res.json(chat);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Server error creating chat" });
     }
-
-    res.json(chat);
 });
 
-// Get messages for a chat
-app.get("/messages/:chatId", (req, res) => {
+// Get messages for a chat - protected
+app.get("/messages/:chatId", authMiddleware, async (req, res) => {
     try {
         const { chatId } = req.params;
-        const messages = readData(messagesFile); // assuming synchronous read
-
-        // Ensure comparison is done between strings
-        const chatMessages = messages.filter(
-            (m) => m.chatId.toString() === chatId
-        );
-
-        res.json(chatMessages);
+        const messages = await Message.find({ chatId }).sort({ timestamp: 1 });
+        res.json(messages);
     } catch (error) {
         console.error("Failed to get messages:", error);
         res.status(500).json({ error: "Failed to load messages" });
     }
 });
 
-// Get user info by username (with dp)
-app.get("/get-user/:username", (req, res) => {
-    const users = readData(usersFile);
-    const user = users.find((u) => u.username === req.params.username);
-    if (user) {
-        // Return only necessary fields except password
-        const { password, ...safeUser } = user;
-        res.json(safeUser);
-    } else {
-        res.status(404).json({ message: "User not found" });
-    }
-});
-
-// Post a new message
-app.post("/messages", (req, res) => {
-    const { chatId, sender, content, timestamp } = req.body;
-    if (!chatId || !sender || !content)
-        return res.status(400).json({ message: "Missing fields" });
-
-    const messages = readData(messagesFile);
-    const message = {
-        chatId,
-        sender,
-        content,
-        timestamp: timestamp || Date.now(),
-        sent: true, // message successfully stored => sent
-        seen: false, // initially not seen
-        id: Date.now().toString() + Math.random().toString(36).slice(2), // unique id for message
-    };
-    messages.push(message);
-    writeData(messagesFile, messages);
-
-    res.json(message);
-});
-
-app.post("/messages/seen", (req, res) => {
-    const { chatId, username } = req.body;
-    if (!chatId || !username) {
-        return res.status(400).json({ message: "Missing chatId or username" });
-    }
-
-    const messages = readData(messagesFile);
-    let updated = false;
-
-    messages.forEach((msg) => {
-        // Only mark messages as seen if:
-        // - message belongs to chatId
-        // - message sender is NOT the username (receiver should not mark their own sent messages as seen)
-        // - message is currently not seen
-        if (msg.chatId === chatId && msg.sender !== username && !msg.seen) {
-            msg.seen = true;
-            updated = true;
+// Get user info by username (with dp) - protected
+app.get("/get-user/:username", authMiddleware, async (req, res) => {
+    try {
+        const user = await User.findOne({ username: req.params.username });
+        if (user) {
+            res.json(user);
+        } else {
+            res.status(404).json({ message: "User not found" });
         }
-    });
-
-    if (updated) {
-        writeData(messagesFile, messages);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Server error fetching user" });
     }
-
-    res.json({ success: true, updated });
 });
 
-app.listen(PORT, () => {
+// Post a new message - protected
+app.post("/messages", authMiddleware, async (req, res) => {
+    try {
+        const { chatId, sender, content, timestamp } = req.body;
+        if (!chatId || !sender || !content)
+            return res.status(400).json({ message: "Missing fields" });
+
+        const message = new Message({
+            chatId,
+            sender,
+            content,
+            timestamp: timestamp || Date.now(),
+            sent: true,
+            seen: false
+        });
+        await message.save();
+
+        const chat = await Chat.findById(chatId);
+        if (chat) {
+            const msgJSON = message.toJSON();
+            chat.users.forEach((usr) => {
+                io.to(usr).emit("message", msgJSON);
+            });
+        }
+
+        res.json(message);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Server error sending message" });
+    }
+});
+
+// Mark messages as seen - protected
+app.post("/messages/seen", authMiddleware, async (req, res) => {
+    try {
+        const { chatId, username } = req.body;
+        if (!chatId || !username) {
+            return res.status(400).json({ message: "Missing chatId or username" });
+        }
+
+        const result = await Message.updateMany(
+            { chatId, sender: { $ne: username }, seen: false },
+            { $set: { seen: true } }
+        );
+
+        const updated = result.modifiedCount > 0;
+
+        if (updated) {
+            const chat = await Chat.findById(chatId);
+            if (chat) {
+                chat.users.forEach((usr) => {
+                    io.to(usr).emit("messages_seen", { chatId, username });
+                });
+            }
+        }
+
+        res.json({ success: true, updated });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: "Server error marking messages as seen" });
+    }
+});
+
+server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });

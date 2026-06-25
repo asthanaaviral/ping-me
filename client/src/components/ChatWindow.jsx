@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { apiBase } from "../utils";
 import MessageInput from "./MessageInput";
 
-export default function ChatWindow({ user, chat }) {
+export default function ChatWindow({ user, chat, socket }) {
     const [messages, setMessages] = useState([]);
     const messagesEndRef = useRef(null);
     const [partnerUser, setPartnerUser] = useState(null);
@@ -10,7 +10,9 @@ export default function ChatWindow({ user, chat }) {
     // Fetch messages
     const fetchMessages = () => {
         if (!chat) return;
-        fetch(`${apiBase}/messages/${chat.id}`)
+        fetch(`${apiBase}/messages/${chat.id}`, {
+            headers: { "Authorization": `Bearer ${user.token}` }
+        })
             .then((res) => res.json())
             .then((data) => setMessages(data))
             .catch((err) => console.error("Failed to fetch messages:", err));
@@ -21,7 +23,10 @@ export default function ChatWindow({ user, chat }) {
         if (!chat) return;
         fetch(`${apiBase}/messages/seen`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${user.token}`
+            },
             body: JSON.stringify({ chatId: chat.id, username: user.username }),
         }).catch((err) =>
             console.error("Failed to mark messages as seen:", err)
@@ -34,27 +39,58 @@ export default function ChatWindow({ user, chat }) {
         fetchMessages();
         markMessagesSeen();
 
-        const interval = setInterval(() => {
-            fetchMessages();
-            markMessagesSeen();
-        }, 3000);
+        if (!socket) return;
 
-        return () => clearInterval(interval);
-    }, [chat]);
+        const handleIncomingMessage = (msg) => {
+            if (msg.chatId === chat.id) {
+                setMessages((prev) => {
+                    if (prev.find((m) => m.id === msg.id)) return prev;
+                    return [...prev, msg];
+                });
+
+                if (msg.sender !== user.username) {
+                    markMessagesSeen();
+                }
+            }
+        };
+
+        const handleMessagesSeen = ({ chatId, username }) => {
+            if (chatId === chat.id) {
+                setMessages((prev) =>
+                    prev.map((msg) => {
+                        if (msg.sender === user.username && !msg.seen) {
+                            return { ...msg, seen: true };
+                        }
+                        return msg;
+                    })
+                );
+            }
+        };
+
+        socket.on("message", handleIncomingMessage);
+        socket.on("messages_seen", handleMessagesSeen);
+
+        return () => {
+            socket.off("message", handleIncomingMessage);
+            socket.off("messages_seen", handleMessagesSeen);
+        };
+    }, [chat, socket, user.username]);
 
     // Fetch partner user info
     useEffect(() => {
         if (!chat) return;
 
         const partnerUsername = chat.users.find((u) => u !== user.username);
-        fetch(`${apiBase}/get-user/${partnerUsername}`)
+        fetch(`${apiBase}/get-user/${partnerUsername}`, {
+            headers: { "Authorization": `Bearer ${user.token}` }
+        })
             .then((res) => {
                 if (!res.ok) throw new Error("User not found");
                 return res.json();
             })
             .then((data) => setPartnerUser(data))
             .catch((err) => console.error("Failed to fetch user:", err));
-    }, [chat, user.username]);
+    }, [chat, user.username, user.token]);
 
     // Scroll to bottom on new messages
     useEffect(() => {
@@ -72,11 +108,17 @@ export default function ChatWindow({ user, chat }) {
         try {
             const res = await fetch(`${apiBase}/messages`, {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${user.token}`
+                },
                 body: JSON.stringify(message),
             });
             const data = await res.json();
-            setMessages((prev) => [...prev, data]);
+            setMessages((prev) => {
+                if (prev.find((m) => m.id === data.id)) return prev;
+                return [...prev, data];
+            });
         } catch (err) {
             console.error("Failed to send message:", err);
         }
